@@ -1,18 +1,5 @@
 # CFO Demo Jira Bug Report 
 
-Generated: 2026-05-25  
-Branch inspected: `development`  
-Source reports reviewed:
-
-- `/Users/veerpratapsingh/Downloads/cfo_demo_jira_bug_report_final_clean.md`
-- `/Users/veerpratapsingh/Downloads/cfo_demo_jira_bug_report_final_clean.pdf`
-
-## Review Scope
-
-This package consolidates the PDF and Markdown source reports into a final Jira-ready issue set. The PDF and Markdown contained the same twelve issue IDs, so no separate PDF-only ticket was created. Duplicated wording was consolidated, while all source issues remain represented below.
-
-Static code analysis was performed across the relevant React, Redux, API, model, import, and test paths. Runtime logs and the original local screenshot folder were not available in this repository, so root causes that depend on live data are marked as inferred.
-
 ## Issue Inventory
 
 | Ticket | Priority | Area | Summary |
