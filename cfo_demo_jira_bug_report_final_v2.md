@@ -1,4 +1,4 @@
-# CFO Demo Jira Bug Report - Final v2
+# CFO Demo Jira Bug Report 
 
 Generated: 2026-05-25  
 Branch inspected: `development`  
