@@ -1,33 +1,30 @@
-# Optimize Large-Model Loading for Model 15207 and Similar Large Models
+# Optimize Large-Model Loading by Scoping DataInput and Metadata Queries
 
 ## Problem
 
 While analysing model `15207`, we found several large-model performance issues in the current loading architecture.
 
-Model `15207` makes the problem very visible because it has large dimensions and very large `DataInput.data_values`, but the underlying issue is not specific to only this model. The same patterns can affect other large or complex models as they grow.
+Model `15207` makes the problem very visible because it has large dimensions and very large `DataInput.data_values`, but the underlying issue is not specific to this model. The same patterns can affect other large or complex models as they grow.
 
 The main issue is that several active APIs load more data than the page or action actually needs.
 
 The most serious case is:
 
-```http
-POST /block/{block_id}/outputs/v2
-```
+`POST /block/{block_id}/outputs/v2`
 
-When opening the `Revenue Planning` block output in model `15207`, the backend creates `ModelMetadataCacheV4` before calculation. That cache currently loads all `DataInputs` for the selected model and scenario, not only the inputs needed for the requested block.
+When opening the Revenue Planning block output in model `15207`, the backend creates `ModelMetadataCacheV4` before calculation. That cache currently loads all `DataInputs` for the selected model and scenario, instead of only loading the inputs needed for the requested block.
 
-For model `15207`, this means a `Revenue Planning` output request loads unrelated large inputs from other blocks.
+For model `15207`, this means a Revenue Planning output request loads unrelated large inputs from other blocks.
 
 From the analysis:
 
-- `Revenue Planning` itself is around `1.32 MB`
-- The same request also pulls unrelated input payloads such as:
-  - `P4W Data` around `182 MB`
-  - `Utilization` around `577 MB`
+- Revenue Planning itself is around `1.32 MB`
+- P4W Data is around `182 MB`
+- Utilization is around `577 MB`
 
-This pushes the request into the hundreds of MB range and explains why the request fails before Rust/omni-calc can return useful timing.
+So a single Revenue Planning request can pull hundreds of MB of unrelated input payloads before calculation starts.
 
-The Rust timing report is empty because the failure happens during metadata/data loading, before calculation finishes.
+This explains why the request fails before Rust/omni-calc can return useful timing. The Rust timing report is empty because the failure happens during metadata/data loading, before calculation finishes.
 
 There are also related metadata-loading problems in the model overview and Dashboard V2 setup flows. These pages return simple-looking metadata, but the backend builds those responses by walking ORM relationships or by making repeated per-dimension calls.
 
@@ -39,25 +36,19 @@ This ticket should fix the architecture pattern, not just patch model `15207`.
 
 ### 1. Model Overview Page Load
 
-#### Frontend
+**Frontend**
 
-```text
-ModelOverviewPage/index.tsx dispatches FetchModelBlocks
-```
+`ModelOverviewPage/index.tsx` dispatches `FetchModelBlocks`.
 
-#### API
+**API**
 
-```http
-GET /model/{model_id}
-```
+`GET /model/{model_id}`
 
-#### Backend
+**Backend**
 
-```text
-Model.get -> ModelsModel.json()
-```
+`Model.get -> ModelsModel.json()`
 
-#### Current Issue
+**Current Issue**
 
 `ModelsModel.json()` builds the response by walking ORM relationships for:
 
@@ -68,87 +59,55 @@ Model.get -> ModelsModel.json()
 - Driver checks
 - Model category data
 
-The response is a summary, but the backend does relationship-based work to build it.
+The response is a summary, but the backend performs relationship-based work to build it.
 
 ---
 
 ### 2. Dashboard V2 Setup / Page Load
 
-#### Frontend
+**Frontend**
 
-```text
-useDashboardData dispatches DashboardSliceV2.FetchModelBlocks
-```
+`useDashboardData` dispatches `DashboardSliceV2.FetchModelBlocks`.
 
-#### APIs
+**APIs**
 
-```http
-GET /model/{model_id}/blocks
-GET /model/{model_id}/dimensions
-GET /dimension/{dimension_id}/items
-```
+- `GET /model/{model_id}/blocks`
+- `GET /model/{model_id}/dimensions`
+- `GET /dimension/{dimension_id}/items`
 
-#### Backend
+**Backend**
 
-```text
-BlockList.get -> BlocksModel.json()
-DimensionList.get
-DimensionItemList.get
-```
+- `BlockList.get -> BlocksModel.json()`
+- `DimensionList.get`
+- `DimensionItemList.get`
 
-#### Current Issue
+**Current Issue**
 
-Dashboard V2 uses:
+Dashboard V2 uses `/model/{model_id}/blocks`, which calls `block.json(scenario_id)` for every block.
 
-```http
-GET /model/{model_id}/blocks
-```
+Inside `block.json()`, the code loops through indicators and accesses `ind.input_id` to read input dimensions.
 
-This calls `block.json(scenario_id)` for every block.
+Because `ind.input_id` is a normal SQLAlchemy relationship to `DataInputModel`, the row includes `data_values`, even though Dashboard setup only needs metadata like dimensions.
 
-Inside `block.json()`, the code loops through indicators and accesses:
-
-```python
-ind.input_id
-```
-
-This reads input dimensions through a normal SQLAlchemy relationship to `DataInputModel`.
-
-Because `DataInputModel` includes `data_values`, Dashboard setup can load large raw input payloads even though it only needs metadata such as dimensions.
-
-Dashboard V2 also calls:
-
-```http
-GET /dimension/{dimension_id}/items
-```
-
-once per dimension.
-
-The backend already has a bulk endpoint, so this should be batched.
+Dashboard V2 also calls `/dimension/{dimension_id}/items` once per dimension. The backend already has a bulk endpoint, so this should be batched.
 
 ---
 
 ### 3. Plan / Builder Block Output Load
 
-#### Frontend
+**Frontend**
 
-```text
-fetchAnalysisSectionDataVersion2 / FetchBlockOutputsV2
-```
+`fetchAnalysisSectionDataVersion2 / FetchBlockOutputsV2`
 
-#### API
+**API**
 
-```http
-POST /block/{block_id}/outputs/v2
-```
+`POST /block/{block_id}/outputs/v2`
 
-#### Backend
+**Backend**
 
-```text
-BlockKPIRouter -> BlockKPINewV4Rust -> ModelMetadataCacheV4
-```
+`BlockKPIRouter -> BlockKPINewV4Rust -> ModelMetadataCacheV4`
 
-#### Current Issue
+**Current Issue**
 
 `ModelMetadataCacheV4` query 10 builds one large JSONB object containing `DataInput.data_values` for every indicator in every block of the selected model/scenario.
 
@@ -156,7 +115,7 @@ Python then parses that huge JSON object and stores it in `_data_inputs_cache`.
 
 Individual indicators read from that cache later, but the expensive whole-model load has already happened.
 
-Current query behavior:
+**Current query behaviour**
 
 ```sql
 WHERE b.model_id = $1
@@ -171,21 +130,15 @@ This scopes by model and scenario, but not by requested block or required indica
 
 ### `/model/{model_id}/blocks-indicators`
 
-`/model/{model_id}/blocks-indicators` is not part of the current frontend flow.
+This route is not part of the current frontend flow.
 
-The current frontend breakpoint has this route commented out and uses:
-
-```http
-GET /model/{model_id}/blocks
-```
-
-instead.
+The current frontend breakpoint has this route commented out and uses `/model/{model_id}/blocks` instead.
 
 It can be optimized separately if it becomes active again, but it should not be the main target for this ticket.
 
 ### `/model/{model_id}/blocks_full`
 
-`/model/{model_id}/blocks_full` is also not part of the current active initial page/dashboard flow and should not be used for initial page load.
+This route is also not part of the current active initial page/dashboard flow and should not be used for initial page load.
 
 ---
 
@@ -198,15 +151,13 @@ The core fix is to make data loading match app intent.
 - Opening one block output should load only the data required to calculate that block.
 - Large `DataInput.data_values` should only be loaded after the backend knows which indicators are required.
 
----
-
-## `/outputs/v2` Redesign
+### `/outputs/v2` Redesign
 
 Create a scoped output metadata path for block output calculation.
 
 Do not use a single metadata cache path that always loads all model/scenario `DataInputs`.
 
-### New Flow
+#### New Flow
 
 1. Receive `POST /block/{block_id}/outputs/v2`
 2. Find block and check permission
@@ -219,18 +170,18 @@ Do not use a single metadata cache path that always loads all model/scenario `Da
 9. Build pivot/output response
 10. Return the same response shape expected by the frontend
 
----
+### Replace Whole-Model JSONB Aggregation
 
-## Replace Whole-Model JSONB Aggregation
+Replace the current whole-model JSONB aggregation with a scoped row query.
 
-### Current Pattern
+**Current Pattern**
 
 ```sql
 WHERE b.model_id = $1
 AND di.scenario_id = $2
 ```
 
-### Improved Pattern
+**Improved Pattern**
 
 ```sql
 WHERE di.scenario_id = $1
@@ -239,7 +190,7 @@ AND di.indicator_id = ANY($2)
 
 Instead of asking Postgres to build one giant JSONB object for the whole model, return normal rows for the required indicators and build the cache map in Python.
 
-### Example Loading Contract
+**Example Loading Contract**
 
 ```python
 def load_data_inputs_for_indicators(self, indicator_ids: list[int]) -> None:
@@ -254,15 +205,11 @@ def load_data_inputs_for_indicators(self, indicator_ids: list[int]) -> None:
 
 This keeps the existing `get_data_inputs_for_indicator()` style usable, but the cache contains only scoped data.
 
----
+### Dashboard Metadata Redesign
 
-## Dashboard Metadata Redesign
+Keep `/model/{model_id}/blocks` compatible, or introduce a dedicated endpoint:
 
-Keep `/model/{model_id}/blocks` compatible, or introduce a dedicated endpoint such as:
-
-```http
-GET /model/{model_id}/dashboard-blocks
-```
+`/model/{model_id}/dashboard-blocks`
 
 The response should include only the metadata Dashboard V2 needs:
 
@@ -283,37 +230,32 @@ For indicator input dimensions, fetch only:
 
 Do not use `ind.input_id` inside `block.json()` for Dashboard metadata.
 
-Use a batched query that reads only the required columns.
+Instead, use a batched query that reads only the required columns.
 
----
-
-## Dashboard Dimension Item Redesign
+### Dashboard Dimension Item Redesign
 
 Replace repeated per-dimension calls:
 
-```http
+```text
 GET /dimension/{dimension_id}/items
 GET /dimension/{dimension_id}/items
 GET /dimension/{dimension_id}/items
+...
 ```
 
-with the existing bulk endpoint:
+With the existing bulk endpoint:
 
-```http
+```text
 GET /dimensions/items/bulk?dimension_ids=1,2,3&scenario_id=15180
 ```
 
 The frontend already has:
 
-```text
-apiService.get_dimension_items_bulk()
-```
+`apiService.get_dimension_items_bulk()`
 
 So `DashboardSliceV2` should use that instead of `Promise.all` over `get_dimension_items()`.
 
----
-
-## Model Overview Redesign
+### Model Overview Redesign
 
 Replace `ModelsModel.json()` relationship walking with batched summary queries.
 
@@ -329,7 +271,7 @@ Replace `ModelsModel.json()` relationship walking with batched summary queries.
 - Base scenario
 - Time properties
 
-### Example Grouped Queries
+**Example Grouped Queries**
 
 ```sql
 SELECT model_category_id, COUNT(*)
@@ -362,8 +304,8 @@ This avoids walking ORM relationships block by block and category by category.
 ### `/outputs/v2`
 
 - `POST /block/42405/outputs/v2` does not load `DataInputs` for unrelated blocks.
-- A `Revenue Planning` request does not load `P4W Data.data_values` unless `P4W Data` indicators are part of the dependency graph.
-- A `Revenue Planning` request does not load `Utilization.data_values` unless `Utilization` indicators are part of the dependency graph.
+- A Revenue Planning request does not load `P4W Data.data_values` unless `P4W Data` indicators are part of the dependency graph.
+- A Revenue Planning request does not load `Utilization.data_values` unless `Utilization` indicators are part of the dependency graph.
 - Rust/omni-calc timing is present when calculation runs.
 - The frontend response shape remains compatible.
 
@@ -376,16 +318,12 @@ Add timing around:
 - Rust execution
 - Pivot response build
 
----
-
 ### Dashboard V2
 
 - Dashboard setup loads block metadata without querying or returning `DataInput.data_values`.
 - Dashboard setup loads dimension items through the bulk endpoint.
-- Block, indicator, dimension, connected dimension, and filter selectors keep existing behavior.
+- Block, indicator, dimension, connected dimension, and filter selectors keep existing behaviour.
 - Connected dimension names and indicator names still resolve correctly.
-
----
 
 ### Model Overview
 
@@ -400,8 +338,8 @@ Add timing around:
 
 Add tests or instrumentation to prove:
 
-- `Revenue Planning /outputs/v2` only loads required `DataInput` indicator IDs.
-- Unrelated `P4W Data` and `Utilization` inputs are not loaded for `Revenue Planning` unless the dependency graph requires them.
+- Revenue Planning `/outputs/v2` only loads required `DataInput` indicator IDs.
+- Unrelated `P4W Data` and `Utilization` inputs are not loaded for Revenue Planning unless the dependency graph requires them.
 - Dashboard block metadata does not load `DataInput.data_values`.
 - Dashboard bulk dimension item loading returns the same normalized data as current per-dimension calls.
 - `GET /model/{id}` summary response matches the existing response shape.
@@ -411,11 +349,11 @@ Add tests or instrumentation to prove:
 
 ## Expected Impact
 
-This was discovered through model `15207`, but the improvement applies across large models, complex models, and models that grow over time.
+This issue was discovered through model `15207`, but the improvement applies across large models, complex models, and models that grow over time.
 
 For model `15207`, the biggest improvement is removing unrelated `DataInput.data_values` from a single block output request.
 
-The `Revenue Planning` request should no longer pull hundreds of MB of unrelated `P4W Data` and `Utilization` payloads before calculation.
+The Revenue Planning request should no longer pull hundreds of MB of unrelated `P4W Data` and `Utilization` payloads before calculation.
 
 For other models, this reduces the chance that block output, dashboard setup, or model overview loading becomes slower as more blocks, dimensions, indicators, scenarios, and input values are added.
 
